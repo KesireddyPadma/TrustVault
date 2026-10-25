@@ -1,4 +1,8 @@
 import os, uuid, hashlib, json
+from io import BytesIO
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from pathlib import Path
 from datetime import datetime, timezone
 from functools import wraps
@@ -18,6 +22,45 @@ app = Flask(__name__)
 app.config.update(SECRET_KEY=os.getenv('SECRET_KEY', 'local-dev-only-change-this-key'), SQLALCHEMY_DATABASE_URI=os.getenv('DATABASE_URL', 'sqlite:///' + str(BASE / 'trustvault.db')).replace('postgres://','postgresql://',1), SQLALCHEMY_TRACK_MODIFICATIONS=False, MAX_CONTENT_LENGTH=10*1024*1024, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.getenv('COOKIE_SECURE','0')=='1')
 UPLOAD_DIR = Path(os.getenv('UPLOAD_DIR', str(BASE/'private_uploads')))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Only the Flask server uses the Supabase secret key. Never expose it to browsers.
+SUPABASE_URL = os.getenv('SUPABASE_URL', '').rstrip('/')
+SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY', '')
+SUPABASE_BUCKET = os.getenv('SUPABASE_BUCKET', 'trustvault-documents')
+SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
+
+
+def storage_request(method, storage_key, data=None, mime=None):
+    """Private Supabase Storage API call, after application-level authorization."""
+    if not SUPABASE_ENABLED:
+        raise RuntimeError('Supabase Storage is not configured')
+    if not SUPABASE_URL.startswith('https://'):
+        raise RuntimeError('SUPABASE_URL must use HTTPS')
+    bucket = quote(SUPABASE_BUCKET, safe='')
+    key = quote(storage_key, safe='')
+    url = f'{SUPABASE_URL}/storage/v1/object/{bucket}/{key}'
+    headers = {
+        'apikey': SUPABASE_SERVICE_KEY,
+        'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
+    }
+    if mime:
+        headers['Content-Type'] = mime
+    req = Request(url, data=data, headers=headers, method=method)
+    with urlopen(req, timeout=30) as response:
+        return response.read()
+
+
+def storage_upload(storage_key, data, mime):
+    storage_request('POST', storage_key, data, mime)
+
+
+def storage_download(storage_key):
+    return storage_request('GET', storage_key)
+
+
+def storage_delete(storage_key):
+    storage_request('DELETE', storage_key)
+
 db=SQLAlchemy(app)
 login_manager=LoginManager(app)
 login_manager.login_view='login'
@@ -155,15 +198,50 @@ def upload():
     data=file.read(10*1024*1024+1)
     if not data or len(data)>10*1024*1024 or not valid_content(ext,data):
         flash('Invalid file type or size (10 MB maximum).','error'); return redirect(url_for('dashboard'))
-    key=uuid.uuid4().hex
-    (UPLOAD_DIR/key).write_bytes(data)
+    # sb_ prefix distinguishes new Supabase objects from legacy local files.
+    key=('sb_' if SUPABASE_ENABLED else '') + uuid.uuid4().hex
+    try:
+        if SUPABASE_ENABLED:
+            storage_upload(key, data, ALLOWED[ext])
+        else:
+            (UPLOAD_DIR/key).write_bytes(data)
+            
+    except (HTTPError, URLError, OSError, RuntimeError) as exc:
+        print("SUPABASE UPLOAD ERROR:", repr(exc), flush=True)
+        app.logger.error('Storage upload failed: %s', type(exc).__name__)
+        flash('Upload failed. Please try again later.','error')
+        return redirect(url_for('dashboard'))
     doc=Document(owner_id=current_user.id,title=(title[:200] or filename),filename=filename,storage_key=key,mime=ALLOWED[ext],sha256=hashlib.sha256(data).hexdigest(),size=len(data))
-    db.session.add(doc); db.session.commit(); log('upload',doc.id,filename)
+    try:
+        db.session.add(doc); db.session.commit()
+    except Exception:
+        db.session.rollback()
+        try:
+            if key.startswith('sb_'): storage_delete(key)
+            else: (UPLOAD_DIR/key).unlink(missing_ok=True)
+        except Exception: app.logger.warning('Could not clean up orphaned upload')
+        raise
+    log('upload',doc.id,filename)
     flash('Document uploaded securely.','success'); return redirect(url_for('dashboard'))
 @app.get('/documents/<int:doc_id>/download')
 @login_required
 def download(doc_id):
     doc=document_or_404(doc_id); require_doc(doc,'read')
+    if doc.storage_key.startswith('sb_'):
+        try:
+            data=storage_download(doc.storage_key)
+        except HTTPError as exc:
+            if exc.code==404: abort(404)
+            app.logger.error('Storage download failed: HTTP %s', exc.code)
+            abort(502)
+        except (URLError, OSError, RuntimeError):
+            app.logger.error('Storage download failed')
+            abort(502)
+        if hashlib.sha256(data).hexdigest()!=doc.sha256:
+            app.logger.error('Document checksum mismatch: id=%s', doc.id)
+            abort(502)
+        log('download',doc.id)
+        return send_file(BytesIO(data),as_attachment=True,download_name=doc.filename,mimetype=doc.mime)
     path=UPLOAD_DIR/doc.storage_key
     if not path.is_file(): abort(404)
     log('download',doc.id)
@@ -181,10 +259,21 @@ def edit_document(doc_id):
 @login_required
 def delete_document(doc_id):
     doc=document_or_404(doc_id); require_doc(doc,'manage')
-    path=UPLOAD_DIR/doc.storage_key
+    # Remove remote file first; if it fails, preserve the document DB record.
+    if doc.storage_key.startswith('sb_'):
+        try:
+            storage_delete(doc.storage_key)
+        except HTTPError as exc:
+            if exc.code!=404:
+                app.logger.error('Storage delete failed: HTTP %s', exc.code)
+                abort(502)
+        except (URLError, OSError, RuntimeError):
+            app.logger.error('Storage delete failed')
+            abort(502)
     Grant.query.filter_by(document_id=doc.id).delete()
     db.session.delete(doc); db.session.commit(); log('delete',doc_id)
-    path.unlink(missing_ok=True)
+    if not doc.storage_key.startswith('sb_'):
+        (UPLOAD_DIR/doc.storage_key).unlink(missing_ok=True)
     flash('Document deleted.','success'); return redirect(url_for('dashboard'))
 @app.post('/documents/<int:doc_id>/share')
 @login_required
